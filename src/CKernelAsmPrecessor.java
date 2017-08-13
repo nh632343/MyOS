@@ -98,6 +98,7 @@ public class CKernelAsmPrecessor {
 			jumps.add("jle");
 			jumps.add("jge");
 			jumps.add("js");
+			jumps.add("je");
 			
 			
     		fileReader = new BufferedReader(new FileReader("ckernel.asm"));

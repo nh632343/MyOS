@@ -22,6 +22,7 @@
 #include "win_sheet.h"
 #include "timer.h"
 #include "global_define.h"
+#include "multi_task.h"
 
 struct MEMMAN* memman = (struct MEMMAN*)0x100000;
 
@@ -36,6 +37,18 @@ void init_palette(void);
 void set_palette(int start, int end, unsigned char *rgb);
 void boxfill8(unsigned char *vram,int xsize,  unsigned char c, int x, int y,
 int x0, int y0);
+
+void taskswitch8();
+
+static char keytable[0x54] = {
+		0,   0,   '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '^', 0,   0,
+		'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '@', '[', 0,   0,   'A', 'S',
+		'D', 'F', 'G', 'H', 'J', 'K', 'L', ';', ':', 0,   0,   ']', 'Z', 'X', 'C', 'V',
+		'B', 'N', 'M', ',', '.', '/', 0,   '*', 0,   ' ', 0,   0,   0,   0,   0,   0,
+		0,   0,   0,   0,   0,   0,   0,   '7', '8', '9', '-', '4', '5', '6', '+', '1',
+		'2', '3', '0', '.'
+	};
+
 
 struct  BOOTINFO {
     char* vgaRam;
@@ -110,20 +123,51 @@ static int xsize = 0, ysize = 0;
 static  unsigned char *buf_back, buf_mouse[256];
 #define COLOR_INVISIBLE  99
 
+void make_textbox8(struct SHEET *sht, int x0, int y0, int sx, int sy, int c);
+static struct SHEET* shtMsgBox;
+static struct SHTCTL *shtctl;
+static struct SHEET *sht_back, *sht_mouse;
+
+void task_b_main(struct SHEET *sht_win_b);
+
+
+static int task_b = 0;
+static struct TIMER g_timer_b;
+
 void CMain(void) {
+
     initBootInfo(&bootInfo);
+
+    unsigned char *buf_win_b;
+    struct SHEET *sht_win_b[3];
+    static struct TASK *task_b[3];
+
     char*vram = bootInfo.vgaRam;
     xsize = bootInfo.screenX, ysize = bootInfo.screenY;
-    struct SHTCTL *shtctl;
-    struct SHEET *sht_back = 0, *sht_mouse = 0;
 
+    struct TIMER *timer, *timer2, *timer3;
 
     init_pit();
-    fifo8_init(&timerinfo, 8, timerbuf);
-    settimer(500, &timerinfo, 1);
-  
-    fifo8_init(&keyinfo, 32, keybuf);
-    fifo8_init(&mouseinfo, 128, mousebuf);
+
+
+    fifo8_init(&timerinfo, 8, timerbuf, 0);
+    timer = timer_alloc();
+    timer_init(timer, &timerinfo, 10);
+    timer_settime(timer, 100);
+
+
+    timer2 = timer_alloc();
+    timer_init(timer2, &timerinfo, 2);
+    timer_settime(timer2, 300);
+
+
+    timer3 = timer_alloc();
+    timer_init(timer3, &timerinfo, 1);
+    timer_settime(timer3, 50);
+
+
+    fifo8_init(&keyinfo, 32, keybuf, 0);
+    fifo8_init(&mouseinfo, 128, mousebuf, 0);
 
 
     init_palette();
@@ -156,32 +200,73 @@ void CMain(void) {
     mx = (xsize - 16) / 2;
     my = (ysize - 28 - 16) / 2;
     sheet_slide(shtctl, sht_mouse, mx, my);
- 
-    struct SHEET* shtMsgBox = message_box(shtctl, "counter");
+    
+    int cursor_x = 8, cursor_c=COL8_FFFFFF;
+    shtMsgBox = message_box(shtctl, "counter");
 
     sheet_updown(shtctl, sht_back, 0);
   
     sheet_updown(shtctl, sht_mouse, 100);
 
-    
 
     io_sti();
     enable_mouse(&mdec);
 
+    
+//switch task
+    int addr_code32 = get_code32_addr();
+    struct SEGMENT_DESCRIPTOR *gdt = (struct SEGMENT_DESCRIPTOR *)get_addr_gdt();
+
+    static struct TSS32 tss_b, tss_a;
+    static struct TASK *task_a;
+
+    task_a = task_init(memman);
+    keyinfo.task = task_a;
+    char taskTitle[6] = {'t','a','s','k', 0, 0};
+    int i = 0;
+   for (i = 0; i < 2; i++) {
+       sht_win_b[i] = sheet_alloc(shtctl);
+       buf_win_b = (unsigned char*)memman_alloc_4k(memman, 144*52);
+       char c = 'b' + i;
+       taskTitle[4] = c;
+       sheet_setbuf(sht_win_b[i], buf_win_b, 144, 52, -1);
+       make_window8(shtctl, sht_win_b[i], taskTitle);
+
+       task_b[i] = task_alloc();
+       task_b[i]->tss.ldtr = 0;
+       task_b[i]->tss.iomap = 0x40000000;
+       task_b[i]->tss.eip =  (int)(task_b_main - addr_code32);
+      
+       task_b[i]->tss.es = 0;
+       task_b[i]->tss.cs = 1*8;//6 * 8;
+       task_b[i]->tss.ss = 4*8;
+       task_b[i]->tss.ds = 3*8;
+       task_b[i]->tss.fs = 0;
+       task_b[i]->tss.gs = 2*8;
+       task_b[i]->tss.esp -= 8;
+       *((int*)(task_b[i]->tss.esp + 4)) = (int)sht_win_b[i];
+
+       task_run(task_b[i], (i+1)*5);
+    }
+
+    sheet_slide(shtctl,sht_win_b[0], 16, 28);
+    sheet_updown(shtctl, sht_win_b[0], 1);
+    
+    sheet_slide(shtctl, sht_win_b[1], 160, 28);
+    sheet_updown(shtctl, sht_win_b[1], 1);
+//switch task
 
     int data = 0;
     int count = 0;
-    struct TIMERCTL *timerctl = getTimerController();
-    
+    i = 0;
+    int pos = 0;
+    int stop_task_A = 0;
 
     for(;;) {
-       char* pStr = intToHexStr(timerctl->timeout);
-       boxfill8(shtMsgBox->buf, 160, COL8_C6C6C6, 40, 28, 119, 43);
-       showString(shtctl, shtMsgBox, 40, 28, COL8_000000,pStr);
 
        io_cli();
        if (fifo8_status(&keyinfo) + fifo8_status(&mouseinfo) +
- fifo8_status(&timerinfo)  == 0) {
+           fifo8_status(&timerinfo) == 0) {
  
            io_sti();
        } else if(fifo8_status(&keyinfo) != 0){
@@ -195,19 +280,107 @@ void CMain(void) {
                   count = 0;
                }
 
+           } else if (keytable[data] != 0 && cursor_x < 144) {
+               boxfill8(shtMsgBox->buf, shtMsgBox->bxsize, COL8_FFFFFF,cursor_x,
+              28, cursor_x + 7, 43);
+              sheet_refresh(shtctl, shtMsgBox, cursor_x, 28, cursor_x+8, 44);
+
+                   char buf[2] = {keytable[data], 0};
+                   showString(shtctl,  shtMsgBox, cursor_x, 28, COL8_000000, buf);
+                   cursor_x += 8;
+                
+              stop_task_A = 1;
+
+              boxfill8(shtMsgBox->buf, shtMsgBox->bxsize, cursor_c, cursor_x,
+              28, cursor_x + 7, 43);
+              sheet_refresh(shtctl, shtMsgBox, cursor_x, 28, cursor_x+8, 44);
            }
                      
        } else if (fifo8_status(&mouseinfo) != 0) {
            show_mouse_info(shtctl, sht_back, sht_mouse);
-       } else if (fifo8_status(&timerinfo) != 0) {
-           //超时发生后进入这里
+       }  else if (fifo8_status(&timerinfo) != 0) {
            io_sti();
-           showString(shtctl, sht_back, 0, 0, COL8_FFFFFF, "5[sec]");
+           int i = fifo8_get(&timerinfo);
+           if (i == 10) {
+                showString(shtctl, sht_back, pos, 144, COL8_FFFFFF,
+                 "A"); 
+                //switch task 
+              //  farjmp(0, 9*8);
+                timer_settime(timer, 100);
+                pos += 8;
+                if (pos > 40 && stop_task_A == 0) {
+                    io_cli();
+                    task_sleep(task_a);
+                    io_sti();
+                 }
+           } else if (i == 2) {
+               showString(shtctl, sht_back, 0, 32, COL8_FFFFFF, "3[sec]");
+           } else {
+               if (i != 0) {
+                  timer_init(timer3, &timerinfo, 0);
+                  cursor_c = COL8_000000;
+               } else {
+                  timer_init(timer3, &timerinfo, 1);
+                  cursor_c = COL8_FFFFFF;
+               }
+
+               timer_settime(timer3, 50);
+               boxfill8(shtMsgBox->buf, shtMsgBox->bxsize, cursor_c, cursor_x,
+               28, cursor_x + 7, 43);
+               sheet_refresh(shtctl, shtMsgBox, cursor_x, 28, cursor_x+8, 44);
+
+           }
        }
-
-    }
-
+    } 
 }
+
+
+
+
+void task_b_main(struct SHEET *sht_win_b) {
+   showString(shtctl, sht_back, 0, 160, COL8_FFFFFF, "enter task b");
+
+    struct FIFO8 timerinfo_b;
+    char timerbuf_b[8];
+    struct TIMER *timer_b = 0;
+
+    int i = 0;
+ 
+    fifo8_init(&timerinfo_b, 8, timerbuf_b, 0);
+    timer_b = timer_alloc();
+    timer_init(timer_b, &timerinfo_b, 123);
+   
+    timer_settime(timer_b, 100);
+   
+    int count = 0;
+
+    int pos = 0;
+    for(;;) {
+       count++;
+       io_cli();
+        if (fifo8_status(&timerinfo_b) == 0) {
+            io_sti();
+        } else {
+           i = fifo8_get(&timerinfo_b);
+           io_sti();
+           if (i == 123) {
+               showString(shtctl, sht_back, pos, 192, COL8_FFFFFF, "B");
+              // farjmp(0, 8*8);
+               timer_settime(timer_b, 100);
+               pos += 8;
+               boxfill8(sht_win_b->buf, 144, COL8_C6C6C6, 24, 28, 104, 44);
+               sheet_refresh(shtctl, sht_win_b, 24, 28, 104, 44);
+
+               char *p = intToHexStr(count);
+               showString(shtctl, sht_win_b, 24, 28, COL8_FFFFFF,p);
+           }
+           
+        }
+     
+    }
+  
+}
+
 
 void init_screen8(char* vram, int xsize, int ysize) {
     boxfill8(vram, xsize, COL8_008484, 0, 0, xsize-1, ysize-29);
@@ -261,17 +434,21 @@ void  show_mouse_info(struct SHTCTL *shtctl, struct SHEET *sht_back,struct SHEET
          computeMousePosition(shtctl, sht_back, &mdec);
         
          sheet_slide(shtctl, sht_mouse, mx, my);
+         if ((mdec.btn & 0x01) != 0) {
+            sheet_slide(shtctl, shtMsgBox, mx - 80, my - 8); 
+         }
     }
 }
 
 void initBootInfo(struct BOOTINFO *pBootInfo) {
-    pBootInfo->vgaRam = (char*)0xa0000;
-    pBootInfo->screenX = 320;
-    pBootInfo->screenY = 200;
+    pBootInfo->vgaRam = (char*)0xe0000000;
+    pBootInfo->screenX = 640;
+    pBootInfo->screenY = 480;
 }
 
 void showString(struct SHTCTL *shtctl ,struct SHEET *sht, int x, int y, char color, unsigned char *s ) {
     int begin = x;
+
     for (; *s != 0x00; s++) {
        showFont8(sht->buf, sht->bxsize, x, y,color, systemFont+ *s * 16);
        x += 8;
@@ -559,12 +736,12 @@ void  showMemoryInfo(struct SHTCTL *shtctl, struct SHEET *sht,struct AddrRangeDe
     showString(shtctl, sht, x, y, color, "BaseAddrH: ");
     char* pBaseAddrH = intToHexStr(desc->baseAddrHigh);
     showString(shtctl, sht, gap, y, color, pBaseAddrH);
-  
+ 
     y += 16;
     showString(shtctl, sht, x, y, color, "lengthLow: ");
     char* pLengthLow = intToHexStr(desc->lengthLow);
     showString(shtctl, sht, gap, y, color, pLengthLow);
-
+/*
     y+= 16;
     showString(shtctl, sht, x, y, color, "lengthHigh: ");
     char* pLengthHigh = intToHexStr(desc->lengthHigh);
@@ -574,6 +751,7 @@ void  showMemoryInfo(struct SHTCTL *shtctl, struct SHEET *sht,struct AddrRangeDe
     showString(shtctl, sht, x, y, color, "type: ");
     char* pType = intToHexStr(desc->type);
     showString(shtctl, sht, gap, y, color, pType);
+*/
 }
 
 struct SHEET*  message_box(struct SHTCTL *shtctl,  char *title) {
@@ -585,11 +763,9 @@ struct SHEET*  message_box(struct SHTCTL *shtctl,  char *title) {
     sheet_setbuf(sht_win, buf_win, 160, 68, -1);
 
     make_window8(shtctl, sht_win, title);
+    make_textbox8(sht_win, 8, 28, 144, 16, COL8_FFFFFF);    
     
-    showString(shtctl, sht_win, 24, 28, COL8_000000, "Welcome to");
-    showString(shtctl, sht_win, 24, 44, COL8_000000, "MyOS");
-    
-    sheet_slide(shtctl, sht_win, 80, 72);
+    sheet_slide(shtctl, sht_win, 260, 172);
     sheet_updown(shtctl, sht_win, 2);
 
     return sht_win;
@@ -652,3 +828,19 @@ void make_window8(struct SHTCTL *shtctl, struct SHEET *sht,  char *title) {
 
     return;
 }
+
+void make_textbox8(struct SHEET *sht, int x0, int y0, int sx, int sy, int c) {
+    int x1 = x0 + sx, y1 = y0 + sy;
+    boxfill8(sht->buf, sht->bxsize, COL8_848484, x0 - 2, y0 - 3, x1 + 1, y0 - 3);
+    boxfill8(sht->buf, sht->bxsize, COL8_848484, x0 - 3, y0 - 3, x0 - 3, y1 + 1);
+    boxfill8(sht->buf, sht->bxsize, COL8_FFFFFF, x0 - 3, y1 + 2, x1 + 1, y1 + 2);
+    boxfill8(sht->buf, sht->bxsize, COL8_FFFFFF, x1 + 2, y0 - 3, x1 + 2, y1 + 2);
+    boxfill8(sht->buf, sht->bxsize, COL8_000000, x0 - 1, y0 - 2, x1 + 0, y0 - 2);
+    boxfill8(sht->buf, sht->bxsize, COL8_000000, x0 - 2, y0 - 2, x0 - 2, y1 + 0);
+    boxfill8(sht->buf, sht->bxsize, COL8_C6C6C6, x0 - 2, y1 + 1, x1 + 0, y1 + 1);
+    boxfill8(sht->buf, sht->bxsize, COL8_C6C6C6, x1 + 1, y0 - 2, x1 + 1, y1 + 1);
+    boxfill8(sht->buf, sht->bxsize, c, x0 - 1, y0 - 1, x1 + 0, y1 + 0); 
+}
+
+
+
